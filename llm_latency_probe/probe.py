@@ -20,12 +20,15 @@ class Endpoint:
 @dataclass
 class RequestResult:
     ok: bool
-    ttft_ms: float = 0.0
+    ttft_ms: float | None = None
     total_ms: float = 0.0
-    completion_tokens: int = 0
-    tokens_per_sec: float = 0.0
+    completion_tokens: int | None = 0
+    tokens_per_sec: float | None = 0.0
     token_count_estimated: bool = False   # True when server omitted usage stats
     error: str | None = None
+    output_kind: str = "empty"
+    first_tool_argument_ms: float | None = None
+    tool_calls_completed: int = 0
 
 
 def _payload(endpoint: Endpoint, prompt: str, max_tokens: int) -> dict:
@@ -48,7 +51,13 @@ async def probe_once(client: httpx.AsyncClient, endpoint: Endpoint,
         headers["Authorization"] = f"Bearer {endpoint.api_key}"
 
     start = time.perf_counter()
-    ttft_ms = 0.0
+    ttft_ms = None
+    first_tool_argument_ms = None
+    first_output_ms = None
+    tools = {}
+    finished_choices = set()
+    saw_done = False
+    invalid_stream = False
     usage_tokens = 0
     counted_deltas = 0
     try:
@@ -62,42 +71,77 @@ async def probe_once(client: httpx.AsyncClient, endpoint: Endpoint,
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     chunk = json.loads(data)
                 except json.JSONDecodeError:
+                    invalid_stream = True
                     continue
                 usage = chunk.get("usage")
                 if usage and usage.get("completion_tokens"):
                     usage_tokens = usage["completion_tokens"]
                 for choice in chunk.get("choices") or []:
-                    delta = (choice.get("delta") or {}).get("content")
-                    if delta:
+                    choice_index = choice.get("index", 0)
+                    if choice.get("finish_reason") in ("tool_calls", "function_call"):
+                        finished_choices.add(choice_index)
+                    delta = choice.get("delta") or {}
+                    text = delta.get("content")
+                    elapsed = (time.perf_counter() - start) * 1000
+                    if text:
                         counted_deltas += 1
-                        if ttft_ms == 0.0:
-                            ttft_ms = (time.perf_counter() - start) * 1000
+                        if ttft_ms is None:
+                            ttft_ms = elapsed
+                        if first_output_ms is None:
+                            first_output_ms = elapsed
+                    calls = delta.get("tool_calls") or []
+                    # Legacy OpenAI function_call streams have one unnamed-index call.
+                    if delta.get("function_call"):
+                        calls = [{"index": 0, "function": delta["function_call"]}]
+                    for call in calls:
+                        key = (choice_index, call.get("index", 0))
+                        item = tools.setdefault(key, {"name": "", "arguments": ""})
+                        function = call.get("function") or {}
+                        item["name"] += function.get("name") or ""
+                        arguments = function.get("arguments") or ""
+                        item["arguments"] += arguments
+                        if arguments and first_tool_argument_ms is None:
+                            first_tool_argument_ms = elapsed
+                        if first_output_ms is None:
+                            first_output_ms = elapsed
     except httpx.HTTPError as e:
         return RequestResult(ok=False, error=f"{type(e).__name__}: {e}")
 
     total_ms = (time.perf_counter() - start) * 1000
 
-    # An empty stream - no usage report and no content tokens - is a failure,
-    # not a zero-token success.
-    if usage_tokens == 0 and counted_deltas == 0:
-        return RequestResult(ok=False, total_ms=total_ms,
-                             error="empty stream: server returned no completion tokens")
+    kind = "mixed" if tools and counted_deltas else (
+        "tool_only" if tools else "text" if counted_deltas else "empty")
+    common = dict(total_ms=total_ms, ttft_ms=ttft_ms, output_kind=kind,
+                  first_tool_argument_ms=first_tool_argument_ms)
+    if invalid_stream:
+        return RequestResult(ok=False, error="malformed SSE JSON", **common)
+    if kind == "empty":
+        return RequestResult(ok=False, error="empty stream: no text or tool calls", **common)
+    for (choice_index, _), item in tools.items():
+        if not saw_done or choice_index not in finished_choices:
+            return RequestResult(ok=False, error="incomplete tool-call stream", **common)
+        try:
+            arguments = json.loads(item["arguments"])
+        except (ValueError, TypeError):
+            return RequestResult(ok=False, error="invalid tool argument JSON", **common)
+        if not item["name"] or not isinstance(arguments, dict):
+            return RequestResult(ok=False, error="tool requires name and object arguments", **common)
 
-    # Prefer the server's usage report. When absent, streamed chunks are only
-    # an approximation of token count (servers may batch multiple tokens per
-    # chunk), so mark the count as estimated.
-    estimated = usage_tokens == 0
-    tokens = usage_tokens or counted_deltas
-    gen_ms = total_ms - ttft_ms
-    tps = (tokens - 1) / (gen_ms / 1000) if gen_ms > 0 and tokens > 1 else 0.0
+    # Tool argument chunks are not tokens. Without server usage we cannot infer
+    # either total tokens or decode throughput for tool-only/mixed responses.
+    estimated = usage_tokens == 0 and not tools
+    tokens = usage_tokens or (counted_deltas if not tools else None)
+    gen_ms = total_ms - first_output_ms if first_output_ms is not None else 0
+    tps = ((tokens - 1) / (gen_ms / 1000) if gen_ms > 0 and tokens > 1 else 0.0
+           ) if tokens is not None else None
     return RequestResult(
-        ok=True, ttft_ms=ttft_ms, total_ms=total_ms,
-        completion_tokens=tokens, tokens_per_sec=tps,
-        token_count_estimated=estimated,
+        ok=True, completion_tokens=tokens, tokens_per_sec=tps,
+        token_count_estimated=estimated, tool_calls_completed=len(tools), **common,
     )
 
 
